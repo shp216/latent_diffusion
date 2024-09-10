@@ -78,14 +78,23 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
     """
 
     def forward(self, x, emb, context=None):
+        input = None
         for layer in self:
             if isinstance(layer, TimestepBlock):
                 x = layer(x, emb)
             elif isinstance(layer, SpatialTransformer):
                 x = layer(x, context)
             else:
-                x = layer(x)
-        return x
+                if isinstance(layer, (Upsample, Downsample)):
+                    print("Upsample, Downsample!")
+                    x, input = layer(x)
+                    
+                else:
+                    print("conv2d")
+                    x = layer(x)
+
+                
+        return x, input
 
 
 class Upsample(nn.Module):
@@ -107,6 +116,7 @@ class Upsample(nn.Module):
             self.conv = conv_nd(dims, self.channels, self.out_channels, 3, padding=padding)
 
     def forward(self, x):
+        input = x
         assert x.shape[1] == self.channels
         if self.dims == 3:
             x = F.interpolate(
@@ -116,7 +126,7 @@ class Upsample(nn.Module):
             x = F.interpolate(x, scale_factor=2, mode="nearest")
         if self.use_conv:
             x = self.conv(x)
-        return x
+        return x, input
 
 class TransposedUpsample(nn.Module):
     'Learned 2x upsampling without padding'
@@ -157,7 +167,7 @@ class Downsample(nn.Module):
 
     def forward(self, x):
         assert x.shape[1] == self.channels
-        return self.op(x)
+        return self.op(x), self.op(x)
 
 
 class ResBlock(TimestepBlock):
@@ -585,7 +595,7 @@ class UNetModel(nn.Module):
                 input_block_chans.append(ch)
                 ds *= 2
                 self._feature_size += ch
-
+        
         if num_head_channels == -1:
             dim_head = ch // num_heads
         else:
@@ -707,7 +717,7 @@ class UNetModel(nn.Module):
         self.middle_block.apply(convert_module_to_f32)
         self.output_blocks.apply(convert_module_to_f32)
 
-    def forward(self, x, timesteps=None, context=None, y=None,**kwargs):
+    def forward(self, x, timesteps=None, context=None, y=None, is_feature: bool = False, **kwargs):
         """
         Apply the model to an input batch.
         :param x: an [N x C x ...] Tensor of inputs.
@@ -720,6 +730,7 @@ class UNetModel(nn.Module):
             self.num_classes is not None
         ), "must specify y if and only if the model is class-conditional"
         hs = []
+        features = []
         t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
         emb = self.time_embed(t_emb)
 
@@ -728,16 +739,46 @@ class UNetModel(nn.Module):
             emb = emb + self.label_emb(y)
 
         h = x.type(self.dtype)
+        #features.append(h)
         for module in self.input_blocks:
-            h = module(h, emb, context)
+            for submodule in module.children():
+                if isinstance(submodule, Downsample):
+                    print("Downsample 모듈 발견!")
+            h, feature = module(h, emb, context)
             hs.append(h)
-        h = self.middle_block(h, emb, context)
+            if feature is not None:
+                features.append(feature)
+        
+        h, feature = self.middle_block(h, emb, context)
+        features.append(h)
+            
         for module in self.output_blocks:
+          
+            for submodule in module.children():
+                if isinstance(submodule, Upsample):
+                    print("Upsample 모듈 발견!")
+
             h = th.cat([h, hs.pop()], dim=1)
-            h = module(h, emb, context)
+            h, feature = module(h, emb, context)
+            if feature is not None:
+                features.append(feature)
         h = h.type(x.dtype)
-        if self.predict_codebook_ids:
-            return self.id_predictor(h)
+
+        #features.append(self.out(h))
+        print("###############################################3")
+        for num,i in enumerate(features):
+            print(f"{num+1}번쨰 feature shape: {i.shape}")
+        print("###############################################3")
+        
+        # if self.predict_codebook_ids:
+        #     print("codebook!!!")
+        #     return self.id_predictor(h)
+        # else:
+        #     print("self.out!!!")
+        #     return self.out(h)
+
+        if is_feature:
+            return self.out(h), features
         else:
             return self.out(h)
 
